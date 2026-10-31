@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mvc - mv for folders that also migrates Claude Code state.
 
-Usage: mvc [-v] [-n] SRC DEST
+Usage: mvc [-v] [-n] [--history=merge|overwrite|abort] SRC DEST
 
 Moves SRC to DEST (mv semantics: if DEST is an existing dir, SRC goes inside it),
 then rewrites Claude Code state so `claude -c` / `claude -r` work from the new
@@ -12,12 +12,20 @@ location with full history:
 Sub-folders of SRC that have their own Claude projects are migrated too.
 Silent on success like mv; -v shows each step, -n (dry run) implies -v.
 Backups of the edited files are written next to them as *.mvc-bak.
+
+If DEST already has Claude history (e.g. from a folder that was deleted), mvc asks
+what to do, or use --history:
+  merge      keep both; on a file-name clash the existing DEST copy wins
+  overwrite  replace DEST's history with SRC's (old copy saved in ~/.claude/mvc-backups)
+  abort      stop before moving anything
+Without a terminal and without --history it aborts.
 """
 import json
 import os
 import re
 import shutil
 import sys
+import time
 
 CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude"))
 PROJECTS = os.path.join(CLAUDE_DIR, "projects")
@@ -101,62 +109,121 @@ def rewrite_file(path, fn):
     return False
 
 
-def migrate(src, dst, dry):
+def plan_projects(src, dst):
+    """[(project_dir, target_dir)] for every Claude project at/under src."""
+    moves = []
+    if not os.path.isdir(PROJECTS):
+        return moves
+    for name in sorted(os.listdir(PROJECTS)):
+        pdir = os.path.join(PROJECTS, name)
+        if not os.path.isdir(pdir):
+            continue
+        cwd = project_cwd(pdir)
+        if cwd is None:
+            # no sessions to read; fall back to exact encoded-name match
+            cwd = src if name == encode(src) else None
+        new_cwd = remap(cwd, src, dst) if cwd else None
+        if new_cwd is not None:
+            moves.append((pdir, os.path.join(PROJECTS, encode(new_cwd))))
+    return moves
+
+
+def load_cfg():
+    if not os.path.isfile(GLOBAL_CFG):
+        return None
+    try:
+        with open(GLOBAL_CFG, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"mvc: warning: skipping {GLOBAL_CFG}: {e}", file=sys.stderr)
+        return None
+    return cfg if isinstance(cfg.get("projects"), dict) else None
+
+
+def find_conflicts(src, dst, moves, cfg):
+    """Existing Claude state at the destination that the move would collide with."""
+    found = []
+    for pdir, target in moves:
+        if target != pdir and os.path.isdir(target) and os.listdir(target):
+            found.append(f"sessions: {target}")
+    if cfg:
+        for k in cfg["projects"]:
+            nk = remap(k, src, dst)
+            if nk is not None and nk != k and nk in cfg["projects"]:
+                found.append(f"settings in ~/.claude.json: {nk}")
+    return found
+
+
+def ask_policy(conflicts, dst):
+    print(f"mvc: destination already has Claude Code history ({dst}):", file=sys.stderr)
+    for c in conflicts:
+        print(f"  - {c}", file=sys.stderr)
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        print("mvc: not a terminal; pass --history=merge|overwrite|abort", file=sys.stderr)
+        return "abort"
+    while True:
+        try:
+            ans = input("[m]erge both, [o]verwrite destination history, [a]bort? ").strip().lower()
+        except EOFError:
+            return "abort"
+        for word in ("merge", "overwrite", "abort"):
+            if ans and word.startswith(ans):
+                return word
+
+
+def stash(path):
+    """Move an existing project dir out of the way, keeping it as a backup."""
+    bdir = os.path.join(CLAUDE_DIR, "mvc-backups")
+    os.makedirs(bdir, exist_ok=True)
+    dest = os.path.join(bdir, f"{os.path.basename(path)}.{time.strftime('%Y%m%d-%H%M%S')}")
+    os.rename(path, dest)
+    log(f"  old destination history saved to {dest}")
+
+
+def migrate(src, dst, dry, moves, cfg, policy):
     # 1. project dirs
-    if os.path.isdir(PROJECTS):
-        for name in sorted(os.listdir(PROJECTS)):
-            pdir = os.path.join(PROJECTS, name)
-            if not os.path.isdir(pdir):
-                continue
-            cwd = project_cwd(pdir)
-            if cwd is None:
-                # no sessions to read; fall back to exact encoded-name match
-                cwd = src if name == encode(src) else None
-            new_cwd = remap(cwd, src, dst) if cwd else None
-            if new_cwd is None:
-                continue
-            target = os.path.join(PROJECTS, encode(new_cwd))
-            log(f"project: {name} -> {os.path.basename(target)}")
-            if dry:
-                continue
-            for fn in os.listdir(pdir):
-                if fn.endswith(".jsonl"):
-                    rewrite_file(os.path.join(pdir, fn),
-                                 lambda t: rewrite_text(t, src, dst, "cwd"))
-            if target != pdir:
-                if os.path.exists(target):
-                    merge(pdir, target)
-                else:
-                    os.rename(pdir, target)
+    for pdir, target in moves:
+        log(f"project: {os.path.basename(pdir)} -> {os.path.basename(target)}")
+        if dry:
+            continue
+        for fn in os.listdir(pdir):
+            if fn.endswith(".jsonl"):
+                rewrite_file(os.path.join(pdir, fn),
+                             lambda t: rewrite_text(t, src, dst, "cwd"))
+        if target == pdir:
+            continue
+        if os.path.exists(target):
+            if policy == "overwrite":
+                stash(target)
+                os.rename(pdir, target)
+            else:
+                merge(pdir, target)
+        else:
+            os.rename(pdir, target)
 
     # 2. ~/.claude.json
-    if os.path.isfile(GLOBAL_CFG):
-        try:
-            with open(GLOBAL_CFG, encoding="utf-8") as f:
-                cfg = json.load(f)
-        except (OSError, ValueError) as e:
-            print(f"mvc: warning: skipping {GLOBAL_CFG}: {e}", file=sys.stderr)
-            cfg = {}
-        projs = cfg.get("projects")
-        if isinstance(projs, dict):
-            changed = {}
-            for k in list(projs):
-                nk = remap(k, src, dst)
-                if nk is not None:
-                    changed[k] = nk
-            if changed:
-                log(f"~/.claude.json: {len(changed)} project entr{'y' if len(changed) == 1 else 'ies'}")
-                if not dry:
-                    new = {}
-                    for k, v in projs.items():
-                        new[changed.get(k, k)] = v
-                    cfg["projects"] = new
-                    backup(GLOBAL_CFG)
-                    tmp = GLOBAL_CFG + ".mvc-tmp"
-                    with open(tmp, "w", encoding="utf-8") as f:
-                        json.dump(cfg, f, indent=2, ensure_ascii=False)
-                    shutil.copystat(GLOBAL_CFG, tmp)
-                    os.replace(tmp, GLOBAL_CFG)
+    if cfg:
+        projs = cfg["projects"]
+        changed = {k: remap(k, src, dst) for k in projs if remap(k, src, dst) is not None}
+        if changed:
+            log(f"~/.claude.json: {len(changed)} project entr{'y' if len(changed) == 1 else 'ies'}")
+            if not dry:
+                new = {k: v for k, v in projs.items() if k not in changed}
+                for k, nk in changed.items():
+                    if nk in new and policy == "merge" and isinstance(new[nk], dict) \
+                            and isinstance(projs[k], dict):
+                        new[nk] = {**projs[k], **new[nk]}  # existing destination wins
+                    elif nk in new and policy == "merge":
+                        pass
+                    else:
+                        new[nk] = projs[k]
+                cfg["projects"] = new
+                backup(GLOBAL_CFG)
+                tmp = GLOBAL_CFG + ".mvc-tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, indent=2, ensure_ascii=False)
+                shutil.copystat(GLOBAL_CFG, tmp)
+                os.replace(tmp, GLOBAL_CFG)
 
     # 3. history.jsonl
     if os.path.isfile(HISTORY):
@@ -172,7 +239,7 @@ def merge(a, b):
         if os.path.isdir(pa) and os.path.isdir(pb):
             merge(pa, pb)
         elif os.path.exists(pb):
-            print(f"  skip (exists): {pb}", file=sys.stderr)
+            print(f"mvc: kept existing {pb} (source copy left in {pa})", file=sys.stderr)
         else:
             os.rename(pa, pb)
     try:
@@ -184,9 +251,15 @@ def merge(a, b):
 def main(argv):
     global VERBOSE
     dry = False
+    policy = None
     args = []
     for a in argv:
-        if a in ("-n", "--dry-run"):
+        if a.startswith("--history="):
+            policy = a.split("=", 1)[1]
+            if policy not in ("merge", "overwrite", "abort"):
+                print("mvc: --history must be merge, overwrite or abort", file=sys.stderr)
+                return 2
+        elif a in ("-n", "--dry-run"):
             dry = True
             VERBOSE = True
         elif a in ("-v", "--verbose"):
@@ -214,6 +287,22 @@ def main(argv):
         print("mvc: cannot move a directory into itself", file=sys.stderr)
         return 1
 
+    moves = plan_projects(src, dst)
+    cfg = load_cfg()
+    conflicts = find_conflicts(src, dst, moves, cfg)
+    if conflicts:
+        if dry:
+            log("destination already has Claude history:")
+            for c in conflicts:
+                log(f"  - {c}")
+            log(f"  policy: {policy or 'ask'}")
+        else:
+            chosen = policy or ask_policy(conflicts, dst)
+            if chosen == "abort":
+                print("mvc: aborted, nothing was moved", file=sys.stderr)
+                return 1
+            policy = chosen
+
     log(f"{src} -> {dst}")
     if not dry:
         try:
@@ -221,7 +310,7 @@ def main(argv):
         except OSError as e:
             print(f"mvc: move failed: {e}", file=sys.stderr)
             return 1
-    migrate(src, dst, dry)
+    migrate(src, dst, dry, moves, cfg, policy)
     if dry:
         log("(dry run, nothing changed)")
     else:

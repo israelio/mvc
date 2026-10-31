@@ -54,13 +54,14 @@ The symlink points at your clone, so keep the folder where it is (or re-run the 
 ## Usage
 
 ```sh
-mvc [-v] [-n] SRC DEST
+mvc [-v] [-n] [--history=merge|overwrite|abort] SRC DEST
 ```
 
 - Same semantics as `mv`: if `DEST` is an existing directory, `SRC` is moved inside it.
 - Silent on success, like `mv`. Errors go to stderr.
 - `-v`, `--verbose`: show each step.
 - `-n`, `--dry-run`: show what would change without changing anything (implies `-v`).
+- `--history=merge|overwrite|abort`: what to do if the destination already has Claude history (see below).
 
 ```sh
 $ mvc -v ~/work/old-name ~/work/new-name
@@ -81,9 +82,27 @@ done. cd '/Users/me/work/new-name' && claude -c
 
 - Sub-folders of `SRC` that have their own Claude projects are migrated too.
 - Edited files get a one-time `*.mvc-bak` backup next to them.
-- If the destination already has a Claude project dir, the two are merged; existing files are not overwritten.
 - Paths are resolved through symlinks (e.g. `/var` → `/private/var` on macOS), matching how Claude records them.
 - `CLAUDE_CONFIG_DIR` is honored.
+
+## When the destination already has history
+
+`mv` refuses to overwrite an existing folder, but Claude history can outlive a folder, for example if
+you deleted a project and now reuse the name. If `DEST` already has Claude Code history, `mvc` checks
+**before moving anything** and asks:
+
+```
+[m]erge both, [o]verwrite destination history, [a]bort?
+```
+
+| Choice | Result |
+|---|---|
+| **merge** | Both sets of sessions end up in the same project. Settings entries are combined. On a name clash, the existing destination copy wins and the source copy is left in place. |
+| **overwrite** | The source history replaces the destination's. The old destination history is saved to `~/.claude/mvc-backups/`, not deleted. |
+| **abort** | Nothing is moved or changed. |
+
+Skip the prompt with `--history=merge|overwrite|abort`. With no terminal (scripts, CI) and no flag,
+`mvc` aborts rather than guess. `-n` shows the conflict without prompting.
 
 ## Limitations
 
