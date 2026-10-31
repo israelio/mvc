@@ -11,7 +11,6 @@ location with full history:
   ~/.claude/history.jsonl              "project" fields rewritten
 Sub-folders of SRC that have their own Claude projects are migrated too.
 Silent on success like mv; -v shows each step, -n (dry run) implies -v.
-Backups of ~/.claude.json and history.jsonl are written next to them as *.mvc-bak.
 
 If DEST already has Claude history (e.g. from a folder that was deleted), mvc asks
 what to do, or use --history:
@@ -88,19 +87,11 @@ def rewrite_text(text, src, dst, key):
     return pat.sub(sub, text)
 
 
-def backup(path):
-    bak = path + ".mvc-bak"
-    if not os.path.exists(bak):
-        shutil.copy2(path, bak)
-
-
-def rewrite_file(path, fn, keep_backup=True):
+def rewrite_file(path, fn):
     with open(path, encoding="utf-8") as f:
         old = f.read()
     new = fn(old)
     if new != old:
-        if keep_backup:
-            backup(path)
         tmp = path + ".mvc-tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(new)
@@ -190,8 +181,7 @@ def migrate(src, dst, dry, moves, cfg, policy):
         for fn in os.listdir(pdir):
             if fn.endswith(".jsonl"):
                 rewrite_file(os.path.join(pdir, fn),
-                             lambda t: rewrite_text(t, src, dst, "cwd"),
-                             keep_backup=False)
+                             lambda t: rewrite_text(t, src, dst, "cwd"))
         if target == pdir:
             continue
         if os.path.exists(target):
@@ -220,7 +210,6 @@ def migrate(src, dst, dry, moves, cfg, policy):
                     else:
                         new[nk] = projs[k]
                 cfg["projects"] = new
-                backup(GLOBAL_CFG)
                 tmp = GLOBAL_CFG + ".mvc-tmp"
                 with open(tmp, "w", encoding="utf-8") as f:
                     json.dump(cfg, f, indent=2, ensure_ascii=False)

@@ -81,7 +81,6 @@ done. cd '/Users/me/work/new-name' && claude -c
 | `~/.claude/history.jsonl` | `project` fields rewritten |
 
 - Sub-folders of `SRC` that have their own Claude projects are migrated too.
-- `~/.claude.json` and `history.jsonl` get a one-time `*.mvc-bak` backup next to them. Session files only have their `cwd` value changed, so they are not duplicated.
 - Paths are resolved through symlinks (e.g. `/var` → `/private/var` on macOS), matching how Claude records them.
 - `CLAUDE_CONFIG_DIR` is honored.
 
