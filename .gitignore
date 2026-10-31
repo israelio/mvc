@@ -1,0 +1,3 @@
+*.mvc-bak
+*.mvc-tmp
+.DS_Store

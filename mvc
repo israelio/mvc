@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""mvc - mv for folders that also migrates Claude Code state.
+
+Usage: mvc [-v] [-n] SRC DEST
+
+Moves SRC to DEST (mv semantics: if DEST is an existing dir, SRC goes inside it),
+then rewrites Claude Code state so `claude -c` / `claude -r` work from the new
+location with full history:
+  ~/.claude/projects/<encoded-path>/   renamed, "cwd" fields rewritten
+  ~/.claude.json                       "projects" keys remapped
+  ~/.claude/history.jsonl              "project" fields rewritten
+Sub-folders of SRC that have their own Claude projects are migrated too.
+Silent on success like mv; -v shows each step, -n (dry run) implies -v.
+Backups of the edited files are written next to them as *.mvc-bak.
+"""
+import json
+import os
+import re
+import shutil
+import sys
+
+CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude"))
+PROJECTS = os.path.join(CLAUDE_DIR, "projects")
+HISTORY = os.path.join(CLAUDE_DIR, "history.jsonl")
+GLOBAL_CFG = os.path.expanduser("~/.claude.json")
+if os.environ.get("CLAUDE_CONFIG_DIR"):
+    GLOBAL_CFG = os.path.join(CLAUDE_DIR, ".claude.json")
+
+
+VERBOSE = False
+
+
+def log(msg):
+    if VERBOSE:
+        print(msg)
+
+
+def encode(path):
+    return re.sub(r"[^a-zA-Z0-9]", "-", path)
+
+
+def remap(path, src, dst):
+    if path == src:
+        return dst
+    if path.startswith(src + "/"):
+        return dst + path[len(src):]
+    return None
+
+
+def project_cwd(pdir):
+    """Real path of a project dir, read from the first cwd found in its sessions."""
+    for name in sorted(os.listdir(pdir)):
+        if not name.endswith(".jsonl"):
+            continue
+        try:
+            with open(os.path.join(pdir, name), encoding="utf-8") as f:
+                for line in f:
+                    m = re.search(r'"cwd":("(?:[^"\\]|\\.)*")', line)
+                    if m:
+                        return json.loads(m.group(1))
+        except OSError:
+            pass
+    return None
+
+
+def rewrite_text(text, src, dst, key):
+    """Replace JSON string values of `key` equal to / under src."""
+    pat = re.compile(r'("%s":)("(?:[^"\\]|\\.)*")' % re.escape(key))
+
+    def sub(m):
+        try:
+            val = json.loads(m.group(2))
+        except ValueError:
+            return m.group(0)
+        new = remap(val, src, dst)
+        if new is None:
+            return m.group(0)
+        return m.group(1) + json.dumps(new, ensure_ascii=False)
+
+    return pat.sub(sub, text)
+
+
+def backup(path):
+    bak = path + ".mvc-bak"
+    if not os.path.exists(bak):
+        shutil.copy2(path, bak)
+
+
+def rewrite_file(path, fn):
+    with open(path, encoding="utf-8") as f:
+        old = f.read()
+    new = fn(old)
+    if new != old:
+        backup(path)
+        tmp = path + ".mvc-tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(new)
+        shutil.copystat(path, tmp)
+        os.replace(tmp, path)
+        return True
+    return False
+
+
+def migrate(src, dst, dry):
+    # 1. project dirs
+    if os.path.isdir(PROJECTS):
+        for name in sorted(os.listdir(PROJECTS)):
+            pdir = os.path.join(PROJECTS, name)
+            if not os.path.isdir(pdir):
+                continue
+            cwd = project_cwd(pdir)
+            if cwd is None:
+                # no sessions to read; fall back to exact encoded-name match
+                cwd = src if name == encode(src) else None
+            new_cwd = remap(cwd, src, dst) if cwd else None
+            if new_cwd is None:
+                continue
+            target = os.path.join(PROJECTS, encode(new_cwd))
+            log(f"project: {name} -> {os.path.basename(target)}")
+            if dry:
+                continue
+            for fn in os.listdir(pdir):
+                if fn.endswith(".jsonl"):
+                    rewrite_file(os.path.join(pdir, fn),
+                                 lambda t: rewrite_text(t, src, dst, "cwd"))
+            if target != pdir:
+                if os.path.exists(target):
+                    merge(pdir, target)
+                else:
+                    os.rename(pdir, target)
+
+    # 2. ~/.claude.json
+    if os.path.isfile(GLOBAL_CFG):
+        try:
+            with open(GLOBAL_CFG, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"mvc: warning: skipping {GLOBAL_CFG}: {e}", file=sys.stderr)
+            cfg = {}
+        projs = cfg.get("projects")
+        if isinstance(projs, dict):
+            changed = {}
+            for k in list(projs):
+                nk = remap(k, src, dst)
+                if nk is not None:
+                    changed[k] = nk
+            if changed:
+                log(f"~/.claude.json: {len(changed)} project entr{'y' if len(changed) == 1 else 'ies'}")
+                if not dry:
+                    new = {}
+                    for k, v in projs.items():
+                        new[changed.get(k, k)] = v
+                    cfg["projects"] = new
+                    backup(GLOBAL_CFG)
+                    tmp = GLOBAL_CFG + ".mvc-tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(cfg, f, indent=2, ensure_ascii=False)
+                    shutil.copystat(GLOBAL_CFG, tmp)
+                    os.replace(tmp, GLOBAL_CFG)
+
+    # 3. history.jsonl
+    if os.path.isfile(HISTORY):
+        if dry:
+            log("history.jsonl: would rewrite project fields")
+        elif rewrite_file(HISTORY, lambda t: rewrite_text(t, src, dst, "project")):
+            log("history.jsonl: updated")
+
+
+def merge(a, b):
+    for fn in os.listdir(a):
+        pa, pb = os.path.join(a, fn), os.path.join(b, fn)
+        if os.path.isdir(pa) and os.path.isdir(pb):
+            merge(pa, pb)
+        elif os.path.exists(pb):
+            print(f"  skip (exists): {pb}", file=sys.stderr)
+        else:
+            os.rename(pa, pb)
+    try:
+        os.rmdir(a)
+    except OSError:
+        pass
+
+
+def main(argv):
+    global VERBOSE
+    dry = False
+    args = []
+    for a in argv:
+        if a in ("-n", "--dry-run"):
+            dry = True
+            VERBOSE = True
+        elif a in ("-v", "--verbose"):
+            VERBOSE = True
+        else:
+            args.append(a)
+    if len(args) != 2:
+        print(__doc__, file=sys.stderr)
+        return 2
+    src_arg, dst_arg = args
+    src_arg = src_arg.rstrip("/") or "/"
+    if not os.path.isdir(src_arg) or os.path.islink(src_arg):
+        print(f"mvc: '{src_arg}' is not a directory", file=sys.stderr)
+        return 1
+    src = os.path.realpath(src_arg)
+    dst = os.path.abspath(os.path.expanduser(dst_arg))
+    if os.path.isdir(dst):
+        dst = os.path.join(os.path.realpath(dst), os.path.basename(src))
+    else:
+        dst = os.path.join(os.path.realpath(os.path.dirname(dst)), os.path.basename(dst))
+    if os.path.exists(dst):
+        print(f"mvc: '{dst}' already exists", file=sys.stderr)
+        return 1
+    if dst == src or dst.startswith(src + "/"):
+        print("mvc: cannot move a directory into itself", file=sys.stderr)
+        return 1
+
+    log(f"{src} -> {dst}")
+    if not dry:
+        try:
+            shutil.move(src, dst)
+        except OSError as e:
+            print(f"mvc: move failed: {e}", file=sys.stderr)
+            return 1
+    migrate(src, dst, dry)
+    if dry:
+        log("(dry run, nothing changed)")
+    else:
+        log(f"done. cd '{dst}' && claude -c")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
