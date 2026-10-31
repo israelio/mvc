@@ -11,7 +11,7 @@ location with full history:
   ~/.claude/history.jsonl              "project" fields rewritten
 Sub-folders of SRC that have their own Claude projects are migrated too.
 Silent on success like mv; -v shows each step, -n (dry run) implies -v.
-Backups of the edited files are written next to them as *.mvc-bak.
+Backups of ~/.claude.json and history.jsonl are written next to them as *.mvc-bak.
 
 If DEST already has Claude history (e.g. from a folder that was deleted), mvc asks
 what to do, or use --history:
@@ -94,12 +94,13 @@ def backup(path):
         shutil.copy2(path, bak)
 
 
-def rewrite_file(path, fn):
+def rewrite_file(path, fn, keep_backup=True):
     with open(path, encoding="utf-8") as f:
         old = f.read()
     new = fn(old)
     if new != old:
-        backup(path)
+        if keep_backup:
+            backup(path)
         tmp = path + ".mvc-tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(new)
@@ -189,7 +190,8 @@ def migrate(src, dst, dry, moves, cfg, policy):
         for fn in os.listdir(pdir):
             if fn.endswith(".jsonl"):
                 rewrite_file(os.path.join(pdir, fn),
-                             lambda t: rewrite_text(t, src, dst, "cwd"))
+                             lambda t: rewrite_text(t, src, dst, "cwd"),
+                             keep_backup=False)
         if target == pdir:
             continue
         if os.path.exists(target):
@@ -242,6 +244,7 @@ def merge(a, b):
             print(f"mvc: kept existing {pb} (source copy left in {pa})", file=sys.stderr)
         else:
             os.rename(pa, pb)
+            log(f"  merged: {fn}")
     try:
         os.rmdir(a)
     except OSError:

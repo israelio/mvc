@@ -81,7 +81,7 @@ done. cd '/Users/me/work/new-name' && claude -c
 | `~/.claude/history.jsonl` | `project` fields rewritten |
 
 - Sub-folders of `SRC` that have their own Claude projects are migrated too.
-- Edited files get a one-time `*.mvc-bak` backup next to them.
+- `~/.claude.json` and `history.jsonl` get a one-time `*.mvc-bak` backup next to them. Session files only have their `cwd` value changed, so they are not duplicated.
 - Paths are resolved through symlinks (e.g. `/var` → `/private/var` on macOS), matching how Claude records them.
 - `CLAUDE_CONFIG_DIR` is honored.
 
@@ -103,6 +103,11 @@ you deleted a project and now reuse the name. If `DEST` already has Claude Code 
 
 Skip the prompt with `--history=merge|overwrite|abort`. With no terminal (scripts, CI) and no flag,
 `mvc` aborts rather than guess. `-n` shows the conflict without prompting.
+
+## Testing
+
+`tests/merge-test.sh` runs the merge scenario in a throwaway sandbox (your real `~/.claude` is never touched)
+and prints PASS/FAIL checks. Use `--keep` to leave the sandbox for inspection.
 
 ## Limitations
 
